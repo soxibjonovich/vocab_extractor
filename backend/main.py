@@ -62,6 +62,8 @@ async def fetch_dictionary(word: str, client: httpx.AsyncClient) -> dict | None:
         meanings = entry.get("meanings", [])
         definitions = []
         synonyms = []
+        # Collect any example found anywhere in the entry (scan all meanings/defs)
+        any_example = ""
 
         for meaning in meanings:
             pos = meaning.get("partOfSpeech", "")
@@ -69,10 +71,19 @@ async def fetch_dictionary(word: str, client: httpx.AsyncClient) -> dict | None:
             syns = meaning.get("synonyms", [])
             synonyms.extend(syns[:3])
             if defs:
+                # Use first def's example; if missing scan remaining defs for one
+                first_example = defs[0].get("example", "")
+                if not first_example:
+                    for d in defs[1:]:
+                        if d.get("example"):
+                            first_example = d["example"]
+                            break
+                if first_example and not any_example:
+                    any_example = first_example
                 definitions.append({
                     "partOfSpeech": pos,
                     "definition": defs[0].get("definition", ""),
-                    "example": defs[0].get("example", ""),
+                    "example": first_example,
                     "synonyms": syns[:3],
                     "antonyms": meaning.get("antonyms", [])[:2],
                 })
@@ -85,6 +96,7 @@ async def fetch_dictionary(word: str, client: httpx.AsyncClient) -> dict | None:
             "phonetic": phonetic,
             "definitions": definitions,
             "synonyms": list(dict.fromkeys(synonyms))[:5],
+            "any_example": any_example,   # best example found anywhere in entry
         }
     except Exception:
         return None
@@ -127,6 +139,73 @@ async def translate(text: str, lang: str, client: httpx.AsyncClient) -> str:
     return "—"
 
 
+def _fallback_example(word: str, pos: str) -> str:
+    """POS-aware fallback example when no dictionary example exists and Groq is off."""
+    import random
+
+    def article(w: str) -> str:
+        """Return 'an' before vowel sounds, 'a' otherwise."""
+        return "an" if w and w[0].lower() in "aeiou" else "a"
+
+    art = article(word)
+
+    templates: dict[str, list[str]] = {
+        "noun": [
+            f"Understanding {word} is essential for anyone studying this subject.",
+            f"The teacher explained the meaning of {word} to the class.",
+            f"She wrote about {word} in her final essay.",
+        ],
+        "verb_base": [          # base / infinitive form
+            f"It is important to {word} things properly.",
+            f"He tried to {word} the situation as best he could.",
+            f"They decided to {word} the process step by step.",
+        ],
+        "verb_past": [          # past tense (-ed)
+            f"She {word} the entire process without any mistakes.",
+            f"They {word} everything carefully before making a decision.",
+            f"He {word} the project successfully last year.",
+        ],
+        "verb_ing": [           # gerund / present participle
+            f"{word.capitalize()} is an important skill in this field.",
+            f"She improved by {word} every day without giving up.",
+            f"The team focused on {word} the problem efficiently.",
+        ],
+        "verb_s": [             # third-person singular (-s)
+            f"She {word} the work every morning before class.",
+            f"He {word} everything carefully and professionally.",
+        ],
+        "adjective": [
+            f"Her {word} attitude helped her succeed in the exam.",
+            f"The professor gave {art} {word} explanation of the topic.",
+            f"This is {art} {word} approach to solving the problem.",
+        ],
+        "adverb": [
+            f"He completed the assignment {word} and without any errors.",
+            f"She {word} explained the concept to her students.",
+            f"The team worked {word} to meet the tight deadline.",
+        ],
+        "default": [
+            f"The word '{word}' appears frequently in academic English.",
+            f"She used '{word}' correctly in her written assignment.",
+        ],
+    }
+
+    # Choose the right verb sub-template
+    if pos.lower() == "verb":
+        if word.endswith("ing"):
+            key = "verb_ing"
+        elif word.endswith("ed"):
+            key = "verb_past"
+        elif word.endswith("s") and len(word) > 3:
+            key = "verb_s"
+        else:
+            key = "verb_base"
+    else:
+        key = pos.lower() if pos.lower() in templates else "default"
+
+    return random.choice(templates[key])
+
+
 async def groq_generate(word: str, pos: str, definition: str, example: str,
                          synonyms: list[str], client: httpx.AsyncClient) -> dict:
     """
@@ -141,7 +220,7 @@ async def groq_generate(word: str, pos: str, definition: str, example: str,
     if not GROQ_KEY:
         result = _rule_based_mistakes(word, pos, definition, synonyms)
         if need_example:
-            result["example"] = f"She showed great {word} in her work."
+            result["example"] = _fallback_example(word, pos)
         return result
 
     syn_text = ", ".join(synonyms) if synonyms else "none"
@@ -363,7 +442,8 @@ async def lookup_word(req: LookupRequest):
     first = dict_data["definitions"][0]
     pos        = first["partOfSpeech"]
     definition = first["definition"]
-    example    = first["example"]
+    # Prefer primary definition's example; fall back to any example found in entry
+    example    = first["example"] or dict_data.get("any_example", "")
     synonyms   = dict_data.get("synonyms", [])
 
     # Generate mistakes & usage (Groq if key available, else rule-based)
