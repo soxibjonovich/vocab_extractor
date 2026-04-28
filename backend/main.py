@@ -23,7 +23,10 @@ app.add_middleware(
 
 # ── Config ───────────────────────────────────────────────────────────────────
 DICT_API     = "https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
-MYMEMORY_API = "https://api.mymemory.translated.net/get?q={text}&langpair=en|{lang}"
+# Add your email as MYMEMORY_EMAIL env var on Render → bumps quota from 5k to 50k words/day
+MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL", "")
+_mm_email_param = f"&de={MYMEMORY_EMAIL}" if MYMEMORY_EMAIL else ""
+MYMEMORY_API = "https://api.mymemory.translated.net/get?q={text}&langpair=en|{lang}" + _mm_email_param
 GROQ_API     = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL   = "llama-3.1-8b-instant"
 GROQ_KEY     = os.getenv("GROQ_API_KEY", "")
@@ -88,21 +91,40 @@ async def fetch_dictionary(word: str, client: httpx.AsyncClient) -> dict | None:
 
 
 async def translate(text: str, lang: str, client: httpx.AsyncClient) -> str:
+    """
+    Translate `text` from English to `lang` (e.g. 'ru', 'uz').
+    Uses Google Translate free endpoint (no key needed) with MyMemory as fallback.
+    """
+    # ── Primary: Google Translate free endpoint ───────────────────────────
+    try:
+        url = (
+            "https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl=en&tl={lang}&dt=t&q={text}"
+        )
+        r = await client.get(url, timeout=6.0,
+                             headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            data = r.json()
+            translated = data[0][0][0].strip()
+            if translated and translated.lower() != text.lower():
+                return html.unescape(translated)
+    except Exception:
+        pass
+
+    # ── Fallback: MyMemory ────────────────────────────────────────────────
     try:
         url = MYMEMORY_API.format(text=text, lang=lang)
         r = await client.get(url, timeout=6.0)
-        if r.status_code != 200:
-            return "—"
-        data = r.json()
-        translated = data.get("responseData", {}).get("translatedText", "").strip()
-        # Decode HTML entities (MyMemory returns e.g. &#39; instead of ')
-        translated = html.unescape(translated)
-        # MyMemory sometimes returns the original word if it can't translate
-        if translated.lower() == text.lower() or not translated:
-            return "—"
-        return translated
+        if r.status_code == 200:
+            data = r.json()
+            translated = data.get("responseData", {}).get("translatedText", "").strip()
+            translated = html.unescape(translated)
+            if translated and translated.lower() != text.lower():
+                return translated
     except Exception:
-        return "—"
+        pass
+
+    return "—"
 
 
 async def groq_generate(word: str, pos: str, definition: str, example: str,
